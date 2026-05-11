@@ -1,0 +1,7 @@
+{
+  "name": "aea2-ondevice-ai",
+  "integrations": {
+    "capacitor": {}
+  },
+  "type": "vue-vite"
+}
