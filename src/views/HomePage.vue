@@ -11,6 +11,7 @@
         <ion-card class="hero">
           <div class="video-wrap">
             <video ref="videoEl" class="video" autoplay playsinline muted />
+            <canvas ref="canvasEl" class="overlay" />
             <div class="hud">
               <div class="hud-row">
                 <span class="pill" :class="{ ok: modelReady }">
@@ -20,6 +21,7 @@
                   Càmera: {{ cameraReady ? 'ON' : 'OFF' }}
                 </span>
                 <span class="pill" :class="{ ok: isRunning }">FPS: {{ fps.toFixed(1) }}</span>
+                <span class="pill" :class="{ ok: isRunning }">Persones: {{ personCount }}</span>
               </div>
               <div v-if="status" class="hud-status">{{ status }}</div>
             </div>
@@ -28,8 +30,8 @@
 
         <ion-card>
           <ion-card-header>
-            <ion-card-title>Classificació en temps real (MobileNet)</ion-card-title>
-            <ion-card-subtitle>Inferència local al dispositiu (sense Wi‑Fi)</ion-card-subtitle>
+            <ion-card-title>Detecció de persones en temps real (COCO‑SSD)</ion-card-title>
+            <ion-card-subtitle>Detecta “person” a la càmera i dibuixa caixes</ion-card-subtitle>
           </ion-card-header>
 
           <ion-card-content>
@@ -46,16 +48,16 @@
             </div>
 
             <ion-list inset>
-              <ion-item v-for="p in predictions" :key="p.className">
+              <ion-item v-for="(p, idx) in persons" :key="idx">
                 <ion-label>
                   <div class="pred-row">
-                    <div class="pred-name">{{ p.className }}</div>
-                    <div class="pred-score">{{ Math.round(p.probability * 100) }}%</div>
+                    <div class="pred-name">Persona</div>
+                    <div class="pred-score">{{ Math.round(p.score * 100) }}%</div>
                   </div>
-                  <ion-progress-bar :value="p.probability" />
+                  <ion-progress-bar :value="p.score" />
                 </ion-label>
               </ion-item>
-              <ion-item v-if="predictions.length === 0">
+              <ion-item v-if="persons.length === 0">
                 <ion-label class="muted">Prem Start per veure resultats.</ion-label>
               </ion-item>
             </ion-list>
@@ -86,13 +88,14 @@ import {
 } from '@ionic/vue';
 import { onBeforeUnmount, ref } from 'vue';
 import * as tf from '@tensorflow/tfjs';
-import { IMAGENET_CLASSES } from '@tensorflow-models/mobilenet/dist/imagenet_classes';
+import * as cocoSsd from '@tensorflow-models/coco-ssd';
 
-type Prediction = { className: string; probability: number };
+type PersonDetection = { bbox: [number, number, number, number]; score: number };
 
 const videoEl = ref<HTMLVideoElement | null>(null);
+const canvasEl = ref<HTMLCanvasElement | null>(null);
 
-const model = ref<tf.GraphModel | null>(null);
+const model = ref<cocoSsd.ObjectDetection | null>(null);
 const modelLoading = ref(false);
 const modelReady = ref(false);
 
@@ -101,7 +104,8 @@ const cameraBusy = ref(false);
 let stream: MediaStream | null = null;
 
 const isRunning = ref(false);
-const predictions = ref<Prediction[]>([]);
+const persons = ref<PersonDetection[]>([]);
+const personCount = ref<number>(0);
 
 const status = ref<string>('');
 const fps = ref<number>(0);
@@ -114,7 +118,16 @@ async function ensureModel() {
   modelLoading.value = true;
   status.value = 'Carregant model… (1a vegada pot trigar uns segons)';
   try {
-    model.value = await tf.loadGraphModel('/models/mobilenet_v2_1.0_224/model.json');
+    await tf.ready();
+    if (tf.getBackend() !== 'webgl') {
+      try {
+        await tf.setBackend('webgl');
+      } catch {
+        // ignore: fallback to current backend
+      }
+    }
+    await tf.ready();
+    model.value = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
     modelReady.value = true;
     status.value = 'Model carregat.';
   } catch (e: any) {
@@ -171,8 +184,9 @@ async function toggleCamera() {
 function startRun() {
   if (isRunning.value || !model.value || !videoEl.value) return;
   isRunning.value = true;
-  status.value = 'Inferència en temps real…';
-  predictions.value = [];
+  status.value = 'Detecció en temps real…';
+  persons.value = [];
+  personCount.value = 0;
   lastFrameMs = performance.now();
   fpsEma = 0;
   loop();
@@ -183,6 +197,14 @@ function stopRun() {
   if (rafId != null) cancelAnimationFrame(rafId);
   rafId = null;
   fps.value = 0;
+  personCount.value = 0;
+  persons.value = [];
+
+  const c = canvasEl.value;
+  if (c) {
+    const ctx = c.getContext('2d');
+    ctx?.clearRect(0, 0, c.width, c.height);
+  }
 }
 
 function toggleRun() {
@@ -200,39 +222,70 @@ async function loop() {
   if (v.readyState < 2) return;
 
   const now = performance.now();
-  if (now - lastFrameMs < 150) return; // ~6-7 FPS target per mòbils modestos
+  if (now - lastFrameMs < 120) return; // ~8 FPS per mòbils modestos
   lastFrameMs = now;
 
   try {
-    const { values, indices } = tf.tidy(() => {
-      const pixels = tf.browser.fromPixels(v);
-      const resized = tf.image.resizeBilinear(pixels, [224, 224], true);
-      const normalized = tf.div(tf.cast(resized, 'float32'), 255);
-      const batched = tf.expandDims(normalized, 0);
-      const pred = m.predict(batched) as tf.Tensor;
-      const logits =
-        pred.rank === 2 && pred.shape[1] === 1001 ? pred.slice([0, 1], [1, 1000]) : pred;
-      const probs = tf.softmax(logits as tf.Tensor2D);
-      const top = tf.topk(probs, 3, true);
-      return { values: top.values, indices: top.indices };
-    });
+    const detections = await m.detect(v, 10, 0.5);
+    const people = detections
+      .filter((d) => d.class === 'person' && (d.score ?? 0) >= 0.5)
+      .map((d) => ({ bbox: d.bbox as [number, number, number, number], score: d.score ?? 0 }))
+      .sort((a, b) => b.score - a.score);
 
-    const vals = await values.data();
-    const idxs = await indices.data();
-    values.dispose();
-    indices.dispose();
-
-    predictions.value = Array.from(idxs).map((idx, i) => ({
-      className: (IMAGENET_CLASSES as any)[idx] ?? `class_${idx}`,
-      probability: vals[i] ?? 0,
-    }));
+    persons.value = people;
+    personCount.value = people.length;
+    drawOverlay(people);
 
     const dt = performance.now() - now;
     const instFps = dt > 0 ? 1000 / dt : 0;
     fpsEma = fpsEma === 0 ? instFps : fpsEma * 0.85 + instFps * 0.15;
     fps.value = fpsEma;
   } catch (e: any) {
-    status.value = `Error inferència: ${e?.message ?? String(e)}`;
+    status.value = `Error detecció: ${e?.message ?? String(e)}`;
+  }
+}
+
+function drawOverlay(people: PersonDetection[]) {
+  const v = videoEl.value;
+  const c = canvasEl.value;
+  if (!v || !c) return;
+  const vw = v.videoWidth || 0;
+  const vh = v.videoHeight || 0;
+  if (vw === 0 || vh === 0) return;
+
+  if (c.width !== vw) c.width = vw;
+  if (c.height !== vh) c.height = vh;
+
+  const ctx = c.getContext('2d');
+  if (!ctx) return;
+  ctx.clearRect(0, 0, c.width, c.height);
+
+  ctx.lineWidth = Math.max(2, Math.round(Math.min(vw, vh) * 0.004));
+  ctx.font = `${Math.max(14, Math.round(Math.min(vw, vh) * 0.035))}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
+  ctx.textBaseline = 'top';
+
+  for (const p of people) {
+    const [x, y, w, h] = p.bbox;
+    ctx.strokeStyle = 'rgba(37, 255, 166, 0.95)';
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+
+    ctx.beginPath();
+    ctx.rect(x, y, w, h);
+    ctx.stroke();
+
+    const label = `Persona ${Math.round(p.score * 100)}%`;
+    const padX = 8;
+    const padY = 6;
+    const textW = ctx.measureText(label).width;
+    const boxW = textW + padX * 2;
+    const fontPx = Number.parseInt(ctx.font, 10) || 14;
+    const boxH = fontPx + padY * 2;
+    const lx = Math.max(0, Math.min(x, vw - boxW));
+    const ly = Math.max(0, y - boxH - 4);
+
+    ctx.fillRect(lx, ly, boxW, boxH);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.92)';
+    ctx.fillText(label, lx + padX, ly + padY);
   }
 }
 
@@ -266,6 +319,14 @@ onBeforeUnmount(() => {
   object-fit: cover;
   display: block;
   filter: saturate(1.05) contrast(1.05);
+}
+
+.overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
 }
 
 .hud {
@@ -335,3 +396,4 @@ onBeforeUnmount(() => {
   opacity: 0.7;
 }
 </style>
+
