@@ -309,7 +309,7 @@ onBeforeUnmount(() => {
 .video-wrap {
   position: relative;
   width: 100%;
-  aspect-ratio: 3 / 4;
+  height: min(45vh, 360px);
   background: linear-gradient(180deg, #0b1220 0%, #0a0f1a 100%);
 }
 
@@ -396,4 +396,3 @@ onBeforeUnmount(() => {
   opacity: 0.7;
 }
 </style>
-
