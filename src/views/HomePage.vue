@@ -101,6 +101,7 @@ const modelReady = ref(false);
 
 const cameraReady = ref(false);
 const cameraBusy = ref(false);
+const facingMode = ref<'user' | 'environment'>('user');
 let stream: MediaStream | null = null;
 
 const isRunning = ref(false);
@@ -145,7 +146,11 @@ async function startCamera() {
   status.value = 'Demanant permisos de càmera…';
   try {
     const s = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' } },
+      video: {
+        facingMode: { ideal: facingMode.value },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+      },
       audio: false,
     });
     stream = s;
@@ -228,7 +233,7 @@ async function loop() {
   try {
     const detections = await m.detect(v, 10, 0.5);
     const people = detections
-      .filter((d) => d.class === 'person' && (d.score ?? 0) >= 0.5)
+      .filter((d) => d.class === 'person' && (d.score ?? 0) >= 0.35)
       .map((d) => ({ bbox: d.bbox as [number, number, number, number], score: d.score ?? 0 }))
       .sort((a, b) => b.score - a.score);
 
