@@ -86,8 +86,9 @@ import {
   IonTitle,
   IonToolbar,
 } from '@ionic/vue';
-import { onBeforeUnmount, ref } from 'vue';
+import { onBeforeUnmount, onMounted, ref } from 'vue';
 import * as tf from '@tensorflow/tfjs';
+import '@tensorflow/tfjs-backend-webgl';
 import * as cocoSsd from '@tensorflow-models/coco-ssd';
 
 type PersonDetection = { bbox: [number, number, number, number]; score: number };
@@ -114,13 +115,17 @@ let rafId: number | null = null;
 let lastFrameMs = 0;
 let fpsEma = 0;
 
+const autoStart = ref(true);
+
 async function ensureModel() {
   if (modelReady.value || modelLoading.value) return;
   modelLoading.value = true;
   status.value = 'Carregant model… (1a vegada pot trigar uns segons)';
   try {
     await tf.ready();
-    if (tf.getBackend() !== 'webgl') {
+    // In some Vite/Ionic builds the WebGL backend can be tree-shaken away unless
+    // explicitly imported (see '@tensorflow/tfjs-backend-webgl' import above).
+    if (tf.getBackend() !== 'webgl' && tf.findBackend('webgl')) {
       try {
         await tf.setBackend('webgl');
       } catch {
@@ -217,6 +222,15 @@ function toggleRun() {
   else startRun();
 }
 
+async function bootstrap() {
+  if (!autoStart.value) return;
+  await ensureModel();
+  if (!modelReady.value) return;
+  await startCamera();
+  if (!cameraReady.value) return;
+  startRun();
+}
+
 async function loop() {
   if (!isRunning.value) return;
   rafId = requestAnimationFrame(loop);
@@ -297,6 +311,10 @@ function drawOverlay(people: PersonDetection[]) {
 onBeforeUnmount(() => {
   stopRun();
   stopCamera();
+});
+
+onMounted(() => {
+  void bootstrap();
 });
 </script>
 
