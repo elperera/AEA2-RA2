@@ -116,6 +116,7 @@ let lastFrameMs = 0;
 let fpsEma = 0;
 
 const autoStart = ref(true);
+const roiRadiusRatio = ref(0.36); // % of min(videoWidth, videoHeight)
 
 async function ensureModel() {
   if (modelReady.value || modelLoading.value) return;
@@ -222,6 +223,24 @@ function toggleRun() {
   else startRun();
 }
 
+function getRoiCircle(vw: number, vh: number) {
+  const r = Math.max(40, Math.round(Math.min(vw, vh) * roiRadiusRatio.value));
+  return { cx: vw / 2, cy: vh / 2, r };
+}
+
+function isInsideRoi(people: PersonDetection[], vw: number, vh: number) {
+  const { cx, cy, r } = getRoiCircle(vw, vh);
+  const r2 = r * r;
+  return people.filter((p) => {
+    const [x, y, w, h] = p.bbox;
+    const px = x + w / 2;
+    const py = y + h / 2;
+    const dx = px - cx;
+    const dy = py - cy;
+    return dx * dx + dy * dy <= r2;
+  });
+}
+
 async function bootstrap() {
   if (!autoStart.value) return;
   await ensureModel();
@@ -239,6 +258,9 @@ async function loop() {
   const v = videoEl.value;
   if (!m || !v) return;
   if (v.readyState < 2) return;
+  const vw = v.videoWidth || 0;
+  const vh = v.videoHeight || 0;
+  if (vw === 0 || vh === 0) return;
 
   const now = performance.now();
   if (now - lastFrameMs < 120) return; // ~8 FPS per mòbils modestos
@@ -246,10 +268,12 @@ async function loop() {
 
   try {
     const detections = await m.detect(v, 10, 0.5);
-    const people = detections
+    const peopleAll = detections
       .filter((d) => d.class === 'person' && (d.score ?? 0) >= 0.35)
       .map((d) => ({ bbox: d.bbox as [number, number, number, number], score: d.score ?? 0 }))
       .sort((a, b) => b.score - a.score);
+
+    const people = isInsideRoi(peopleAll, vw, vh);
 
     persons.value = people;
     personCount.value = people.length;
@@ -278,6 +302,21 @@ function drawOverlay(people: PersonDetection[]) {
   const ctx = c.getContext('2d');
   if (!ctx) return;
   ctx.clearRect(0, 0, c.width, c.height);
+
+  // ROI circle: darken outside area and draw circle guide
+  const { cx, cy, r } = getRoiCircle(vw, vh);
+  ctx.save();
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.28)';
+  ctx.beginPath();
+  ctx.rect(0, 0, vw, vh);
+  ctx.arc(cx, cy, r, 0, Math.PI * 2, true);
+  ctx.fill('evenodd');
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+  ctx.lineWidth = Math.max(2, Math.round(Math.min(vw, vh) * 0.004));
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
 
   ctx.lineWidth = Math.max(2, Math.round(Math.min(vw, vh) * 0.004));
   ctx.font = `${Math.max(14, Math.round(Math.min(vw, vh) * 0.035))}px system-ui, -apple-system, Segoe UI, Roboto, Arial`;
